@@ -21,6 +21,7 @@
 //! | `InterestRateUpdated` | `("InterestRateUpdated",)` | `(old_rate: u32, new_rate: u32)` |
 //! | `DefaultTermUpdated` | `("DefaultTermUpdated",)` | `(old_term: u32, new_term: u32)` |
 //! | `LoanDefaulted` | `("LoanDefaulted", loan_id: u32)` | `borrower: Address` |
+//! | `LoanDefaultReversed` | `("LoanDefaultReversed", loan_id: u32)` | `borrower: Address` |
 //! | `TermLimitsUpdated` | `("TermLimitsUpdated",)` | `(min_term: u32, max_term: u32)` |
 //! | `RateOracleUpdated` | `("RateOracleUpdated",)` | `(old_oracle: Option<Address>, new_oracle: Address)` |
 //! | `CollateralReturned` | `("CollateralReturned", borrower: Address, loan_id: u32)` | `amount: i128` |
@@ -61,8 +62,6 @@ pub fn loan_requested(env: &Env, loan_id: u32, borrower: Address, amount: i128) 
 /// A single call to `approve_loan` in `lib.rs` emits **two** events:
 /// 1. `LoanApproved` (emitted here with loan terms and interest rate)
 /// 2. `LoanApprv` (emitted by [`loan_approved_by_admin`] with admin and borrower address)
-///
-/// Indexers should de-duplicate or reconcile both events.
 ///    Indexers should de-duplicate or reconcile both events.
 pub fn loan_approved(
     env: &Env,
@@ -203,6 +202,16 @@ pub fn default_term_updated(env: &Env, old_term: u32, new_term: u32) {
 /// - **Data**: `borrower: Address`
 pub fn loan_defaulted(env: &Env, loan_id: u32, borrower: Address) {
     let topics = (Symbol::new(env, "LoanDefaulted"), loan_id);
+    env.events().publish(topics, borrower);
+}
+
+/// Emits event when an administratively disputed default is reversed and the
+/// loan is reinstated (#1803).
+///
+/// - **Topics**: `("LoanDefaultReversed", loan_id: u32)`
+/// - **Data**: `borrower: Address`
+pub fn loan_default_reversed(env: &Env, loan_id: u32, borrower: Address) {
+    let topics = (Symbol::new(env, "LoanDefaultReversed"), loan_id);
     env.events().publish(topics, borrower);
 }
 

@@ -164,11 +164,20 @@ export const contestDefault = asyncHandler(
 
     // Check loan exists and is defaulted
     const loanResult = await query(
-      `SELECT loan_id FROM contract_events WHERE loan_id = $1 AND event_type = 'LoanDefaulted' LIMIT 1`,
+      `SELECT address FROM contract_events WHERE loan_id = $1 AND event_type = 'LoanDefaulted' LIMIT 1`,
       [loanId],
     );
     if (loanResult.rows.length === 0) {
       throw AppError.badRequest('Loan is not defaulted or does not exist');
+    }
+
+    // Ownership check (BOLA/IDOR): the `address` on the LoanDefaulted event is
+    // the loan's borrower, so only that wallet may contest the default. The
+    // route also runs `requireLoanOwner`; keeping the assertion here makes the
+    // handler safe wherever it is mounted.
+    const loanBorrower = loanResult.rows[0].address as string | undefined;
+    if (loanBorrower !== borrower) {
+      throw AppError.forbidden('You are not the borrower of this loan');
     }
 
     // Insert dispute record and return disputeId
@@ -351,6 +360,7 @@ export const getBorrowerLoans = asyncHandler(async (req: Request, res: Response)
           MAX(CASE WHEN event_type = 'LoanApproved' THEN interest_rate_bps END) as rate_bps,
           MAX(CASE WHEN event_type = 'LoanApproved' THEN term_ledgers END) as term_ledgers,
           SUM(CASE WHEN event_type = 'LoanRepaid' THEN amount::numeric ELSE 0 END) as total_repaid,
+          SUM(CASE WHEN event_type = 'LateFeeCharged' THEN amount::numeric ELSE 0 END) as accrued_late_fee,
           MAX(CASE WHEN event_type = 'LoanDefaulted' THEN 1 ELSE 0 END) as is_defaulted,
           (
             ARRAY_AGG(
@@ -451,6 +461,7 @@ export const getBorrowerLoans = asyncHandler(async (req: Request, res: Response)
       accruedInterest: isPending
         ? null
         : Number.parseFloat((row.accrued_interest as string) || '0'),
+      accruedLateFee: Number.parseFloat((row.accrued_late_fee as string) || '0'),
       totalRepaid: Number.parseFloat((row.total_repaid as string) || '0'),
       totalOwed: isPending ? null : Number.parseFloat((row.total_owed as string) || '0'),
       nextPaymentDeadline: new Date(row.next_payment_deadline as string).toISOString(),
@@ -598,6 +609,8 @@ export const getLoanDetails = asyncHandler(async (req: Request, res: Response) =
   const totalOwed = Number(
     remainingPrincipal(principalStroops, totalRepaidStroops) + accruedInterestStroops,
   );
+  const extensionFeeStroops =
+    (remainingPrincipal(principalStroops, totalRepaidStroops) * 100n) / 10_000n;
 
   res.json({
     success: true,
@@ -619,6 +632,7 @@ export const getLoanDetails = asyncHandler(async (req: Request, res: Response) =
             : 'repaid',
       requestedAt: requestEvent?.ledger_closed_at,
       approvedAt: approvalEvent?.ledger_closed_at,
+      extensionFee: Number(extensionFeeStroops) / 10_000_000,
       events: events.map((event: Record<string, unknown>) => ({
         type: event.event_type,
         amount: event.amount,
@@ -1194,6 +1208,45 @@ export const submitTransaction = asyncHandler(async (req: Request, res: Response
     status: sr.status,
   });
 
+  res.json({
+    success: true,
+    txHash: sr.txHash,
+    status: sr.status,
+    ...(sr.resultXdr ? { resultXdr: sr.resultXdr } : {}),
+  });
+});
+
+export const submitRefinanceTransaction = asyncHandler(async (req: Request, res: Response) => {
+  const borrower = req.user?.publicKey;
+  const loanId = Number.parseInt(req.params.loanId as string, 10);
+  const { signedTxXdr } = req.body as { signedTxXdr: string };
+  if (!borrower) throw AppError.unauthorized('Authentication required');
+  if (!signedTxXdr) {
+    throw AppError.badRequest('signedTxXdr is required', ErrorCode.MISSING_FIELD, 'signedTxXdr');
+  }
+  if (!Number.isSafeInteger(loanId) || loanId <= 0) {
+    throw AppError.badRequest('Invalid loan ID', ErrorCode.INVALID_LOAN_ID, 'loanId');
+  }
+
+  const adminSignedTxXdr = await sorobanService.signRefinanceAuthorization(
+    signedTxXdr,
+    borrower,
+    loanId,
+  );
+  const result = await withStellarAndDbTransaction(
+    async () => sorobanService.submitSignedTx(adminSignedTxXdr),
+    async (stellarResult: unknown, client) => {
+      const sr = stellarResult as { txHash: string; status: string };
+      await client.query(
+        `INSERT INTO transaction_submissions (tx_hash, status, submitted_at, submitted_by)
+           VALUES ($1, $2, NOW(), $3)
+           ON CONFLICT (tx_hash) DO UPDATE SET status = EXCLUDED.status, submitted_at = EXCLUDED.submitted_at`,
+        [sr.txHash, sr.status, borrower],
+      );
+      return { recorded: true };
+    },
+  );
+  const sr = result.stellarResult as { txHash: string; status: string; resultXdr?: string };
   res.json({
     success: true,
     txHash: sr.txHash,
