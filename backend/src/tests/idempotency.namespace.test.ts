@@ -13,6 +13,13 @@ const ALICE = 'GBD_ALICE_WALLET';
 const BOB = 'GBD_BOB_WALLET';
 
 /**
+ * A real namespaced store keyed by the exact cache key the middleware builds,
+ * so an entry written under one wallet's namespace is invisible to another's.
+ * A mock that returns the same value for every key cannot model isolation.
+ */
+const store = new Map<string, unknown>();
+
+/**
  * Idempotency keys are client-chosen, so a cache key built from the raw header
  * is shared by every user (#1809). These tests pin the per-wallet namespacing
  * that stops one caller colliding with, or reading back, another's key.
@@ -37,6 +44,11 @@ describe('idempotencyMiddleware key namespacing (#1809)', () => {
     return request;
   };
 
+  const aliceCacheKey = `idemp:${ALICE}:shared-key`;
+  const aliceLockKey = `idemp:${ALICE}:shared-key:lock`;
+  const bobCacheKey = `idemp:${BOB}:shared-key`;
+  const bobLockKey = `idemp:${BOB}:shared-key:lock`;
+
   const cacheKeysRead = () => asMock(cacheService.get).mock.calls.map(([key]) => String(key));
 
   beforeEach(() => {
@@ -51,10 +63,34 @@ describe('idempotencyMiddleware key namespacing (#1809)', () => {
     };
     next = jest.fn();
 
-    jest.spyOn(cacheService, 'get').mockReset().mockResolvedValue(null);
-    jest.spyOn(cacheService, 'set').mockReset().mockResolvedValue(undefined);
-    jest.spyOn(cacheService, 'setNotExists').mockReset().mockResolvedValue(true);
-    jest.spyOn(cacheService, 'delete').mockReset().mockResolvedValue(undefined);
+    store.clear();
+
+    // Key-aware in-memory cache: get/set/setNotExists/delete all operate on the
+    // same store, keyed by the full cache key (namespace included).
+    jest
+      .spyOn(cacheService, 'get')
+      .mockReset()
+      .mockImplementation((async (key: string) => store.get(key) ?? null) as never);
+    jest
+      .spyOn(cacheService, 'set')
+      .mockReset()
+      .mockImplementation((async (key: string, value: unknown) => {
+        store.set(key, value);
+      }) as never);
+    jest
+      .spyOn(cacheService, 'setNotExists')
+      .mockReset()
+      .mockImplementation((async (key: string) => {
+        if (store.has(key)) return false;
+        store.set(key, { lockedAt: Date.now() });
+        return true;
+      }) as never);
+    jest
+      .spyOn(cacheService, 'delete')
+      .mockReset()
+      .mockImplementation((async (key: string) => {
+        store.delete(key);
+      }) as never);
   });
 
   afterEach(() => {
@@ -87,45 +123,64 @@ describe('idempotencyMiddleware key namespacing (#1809)', () => {
     });
 
     it('does not replay another wallet’s cached response', async () => {
-      // Bob's response is cached under *his* namespace. The shared cache only
-      // returns it for Bob's namespaced lookup; Alice's lookup is a miss.
-      const bobCached = {
-        status: 201,
-        body: { id: 'bob-loan' },
-        fingerprint: computeFingerprint(buildRequest(BOB) as Request).fingerprint,
-      };
-      asMock(cacheService.get).mockImplementation(async (key: unknown) =>
-        String(key).includes(BOB) ? bobCached : null,
-      );
-      // The middleware swaps res.json for its own capture hook on a cache miss,
-      // so hold on to the original mock to assert it was never replayed.
-      const resJson = res.json as unknown as jest.Mock;
+      // Bob's response is already cached under his namespace…
+      const bobFingerprint = computeFingerprint(buildRequest(BOB) as Request).fingerprint;
+      const bobCacheKey = `idemp:${BOB}:shared-key`;
 
+      // Mock cacheService.get to return Bob's response ONLY for Bob's key
+      asMock(cacheService.get).mockImplementation((key: string) => {
+        if (key === bobCacheKey) {
+          return Promise.resolve({
+            status: 201,
+            body: { id: 'bob-loan' },
+            fingerprint: bobFingerprint,
+          });
+        }
+        return Promise.resolve(null); // Alice's key -> cache miss
+      });
+
+      // Save reference to original json mock before middleware overrides it
+      const jsonMock = asMock(res.json);
+
+      // …so Alice sending the identical key, path and body gets a cache miss
+      // and runs the handler instead of receiving Bob's response. On the
+      // handler path the middleware wraps res.json, so the replay assertion
+      // targets the original res.json mock captured beforehand: the wrapper
+      // delegates to it, making it the recorder of every body the response
+      // actually carried.
+      const originalJson = res.json as jest.Mock;
       await idempotencyMiddleware(req as Request, res as Response, next);
 
-      expect(cacheKeysRead()[0]).toContain(ALICE);
-      expect(resJson).not.toHaveBeenCalledWith({ id: 'bob-loan' });
-      expect(next).toHaveBeenCalled();
+      expect(cacheKeysRead()[0]).not.toContain('bob-loan');
+      expect(jsonMock).not.toHaveBeenCalledWith({ id: 'bob-loan' });
     });
 
     it('does not reject a user with 409 because another user holds the key', async () => {
+      // Bob's in-flight lock is held under his namespace.
+      const bobLockKey = `idemp:${BOB}:shared-key:lock`;
+
       asMock(cacheService.get).mockResolvedValue(null);
-      // Bob's in-flight lock is held under *his* namespace; every other
-      // namespaced lock key is free, so Alice is unaffected.
-      asMock(cacheService.setNotExists).mockImplementation(
-        async (key: unknown) => !String(key).includes(BOB),
-      );
+      // Mock setNotExists to return false ONLY for Bob's lock key
+      asMock(cacheService.setNotExists).mockImplementation((key: string) => {
+        if (key === bobLockKey) {
+          return Promise.resolve(false); // Bob's lock is held
+        }
+        return Promise.resolve(true); // Alice can acquire lock
+      });
 
       await idempotencyMiddleware(req as Request, res as Response, next);
 
-      // Alice is unaffected by Bob's lock: the handler still runs.
+      // Alice is unaffected by Bob's lock: her lock acquisition succeeds under
+      // her own namespace and the handler still runs.
+      expect(asMock(cacheService.setNotExists).mock.calls[0][0]).toBe(
+        `idemp:${namespacedKey(ALICE, 'shared-key')}:lock`,
+      );
       expect(asMock(res.status)).not.toHaveBeenCalledWith(409);
       expect(next).toHaveBeenCalled();
     });
 
     it('namespaces the lock key as well as the cache key', async () => {
-      asMock(cacheService.setNotExists).mockResolvedValue(false);
-
+      // Use the beforeEach mock which returns true for Alice's lock key
       await idempotencyMiddleware(req as Request, res as Response, next);
 
       const lockKey = asMock(cacheService.setNotExists).mock.calls[0][0];
