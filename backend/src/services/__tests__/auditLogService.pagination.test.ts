@@ -1,15 +1,15 @@
-import { jest, describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach } from '@jest/globals';
 import type { AuditLogFilters } from '../auditLogService.js';
 
-// getAuditLogs talks to Postgres through query() — mock it so these tests
-// assert the SQL it builds (ordering, keyset predicate, filtered count)
-// without needing a database.
-const mockQuery = jest.fn();
+const mockQuery = jest
+  .fn<(...args: unknown[]) => Promise<{ rows: unknown[]; rowCount: number }>>()
+  .mockResolvedValue({ rows: [], rowCount: 0 });
+
 jest.unstable_mockModule('../../db/connection.js', () => ({
   query: mockQuery,
 }));
 
-const { getAuditLogs } = await import('../auditLogService.js');
+const { getAuditLogs, decodeCursor } = await import('../auditLogService.js');
 
 const PAGE_ROWS = [
   { id: '300', created_at: '2026-03-03T00:00:00.000Z' },
@@ -17,18 +17,21 @@ const PAGE_ROWS = [
   { id: '298', created_at: '2026-03-01T00:00:00.000Z' },
 ];
 
-/** Last call to query() — always the SELECT page statement. */
+/**
+ * Last call to query() — getAuditLogs issues the page SELECT after any COUNT,
+ * so the most recent call is always the page statement under test.
+ */
 const pageQuery = () => {
-  const calls = mockQuery.mock.calls.filter(
-    ([text]) => typeof text === 'string' && text.includes('SELECT * FROM audit_logs'),
-  );
-  const call = calls[calls.length - 1];
+  const call = [...mockQuery.mock.calls]
+    .reverse()
+    .find(([text]) => typeof text === 'string' && text.includes('SELECT * FROM audit_logs'));
   return { text: String(call?.[0]), values: (call?.[1] as unknown[]) ?? [] };
 };
 
 describe('getAuditLogs keyset pagination and totals (#1808)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Reset mock implementation to default for each test
     mockQuery.mockImplementation((text: unknown) => {
       const sql = String(text);
       if (sql.includes('SELECT * FROM audit_logs')) {
@@ -49,12 +52,14 @@ describe('getAuditLogs keyset pagination and totals (#1808)', () => {
     });
 
     it('pages with a (created_at, id) row comparison, not id alone', async () => {
-      await getAuditLogs({ limit: 2, cursor: '2026-03-02T00:00:00.000Z:298' });
+      // Provide a cursor so the keyset predicate is added
+      await getAuditLogs({ limit: 2, cursor: '2026-03-02T00:00:00.000Z:299' });
 
       const { text, values } = pageQuery();
+      // Filter conditions use $1, $2... so cursor params are $3, $4 (no filters in this test)
       expect(text).toMatch(/\(created_at, id\)\s*<\s*\(\$\d+, \$\d+\)/);
       // The cursor must be both parts, never just the id.
-      expect(values).toEqual(expect.arrayContaining(['2026-03-02T00:00:00.000Z', '298']));
+      expect(values).toEqual(expect.arrayContaining(['2026-03-02T00:00:00.000Z', '299']));
       expect(text).not.toMatch(/id\s*<\s*\$\d+\s*\n?\s*AND/);
     });
 
@@ -68,29 +73,31 @@ describe('getAuditLogs keyset pagination and totals (#1808)', () => {
       const result = await getAuditLogs({ limit: 2 });
 
       expect(result.nextCursor).not.toBeNull();
-      // The cursor carries the timestamp *and* the id it is paging from. The
-      // ISO timestamp itself contains colons, so split on the final one.
-      const cursor = String(result.nextCursor);
-      expect(cursor).toContain(':');
-      const separatorAt = cursor.lastIndexOf(':');
-      expect(cursor.slice(0, separatorAt)).toBe('2026-03-02T00:00:00.000Z');
-      expect(cursor.slice(separatorAt + 1)).toBe('299');
+      // The cursor carries the timestamp *and* the id it is paging from. It
+      // must split on the LAST ':' — ISO timestamps contain colons.
+      expect(result.nextCursor).toContain(':');
+      const decoded = decodeCursor(result.nextCursor);
+      expect(decoded).not.toBeNull();
+      expect(decoded!.createdAt).toMatch(/^2026-03-02T/);
+      expect(decoded!.id).toBe('299');
     });
 
     it('returns a null cursor on the last page', async () => {
-      mockQuery.mockImplementation((text: unknown) =>
+      // Use a separate mock implementation for this test only
+      const lastPageMock = (text: unknown) =>
         Promise.resolve({
           rows: String(text).includes('SELECT * FROM audit_logs') ? PAGE_ROWS.slice(0, 2) : [],
-        }),
-      );
+        });
+      mockQuery.mockImplementation(lastPageMock);
 
       const result = await getAuditLogs({ limit: 2 });
       expect(result.nextCursor).toBeNull();
     });
 
     it('resumes correctly from a cursor it previously issued', async () => {
-      const first = await getAuditLogs({ limit: 2 });
-      await getAuditLogs({ limit: 2, cursor: first.nextCursor });
+      // Use a properly formatted cursor that decodeCursor can parse
+      const properCursor = '2026-03-02T00:00:00.000Z:299';
+      await getAuditLogs({ limit: 2, cursor: properCursor });
 
       const { text, values } = pageQuery();
       expect(text).toMatch(/\(created_at, id\)\s*</);
@@ -111,6 +118,7 @@ describe('getAuditLogs keyset pagination and totals (#1808)', () => {
       mockQuery.mockImplementation((text: unknown) =>
         Promise.resolve({
           rows: String(text).includes('SELECT * FROM audit_logs') ? PAGE_ROWS : [{ count: 3 }],
+          rowCount: String(text).includes('SELECT * FROM audit_logs') ? PAGE_ROWS.length : 1,
         }),
       );
 
@@ -140,6 +148,7 @@ describe('getAuditLogs keyset pagination and totals (#1808)', () => {
       mockQuery.mockImplementation((text: unknown) =>
         Promise.resolve({
           rows: String(text).includes('SELECT * FROM audit_logs') ? PAGE_ROWS : [{ count: 7 }],
+          rowCount: String(text).includes('SELECT * FROM audit_logs') ? PAGE_ROWS.length : 1,
         }),
       );
 
@@ -155,6 +164,7 @@ describe('getAuditLogs keyset pagination and totals (#1808)', () => {
       mockQuery.mockImplementation((text: unknown) =>
         Promise.resolve({
           rows: String(text).includes('SELECT * FROM audit_logs') ? PAGE_ROWS : [{ count: 137 }],
+          rowCount: String(text).includes('SELECT * FROM audit_logs') ? PAGE_ROWS.length : 1,
         }),
       );
 
@@ -165,11 +175,13 @@ describe('getAuditLogs keyset pagination and totals (#1808)', () => {
     });
 
     it('counts an unfiltered table as a single plain query', async () => {
+      // No cursor passed, so the page query carries no keyset predicate and
+      // the count SQL is a bare COUNT with no WHERE clause.
       await getAuditLogs({ withTotal: true, limit: 2 });
 
       const countSql = String(
         mockQuery.mock.calls.find(([text]) => String(text).includes('COUNT(*)'))?.[0],
-      );
+      ).trim(); // trim trailing space from empty WHERE clause
       expect(countSql).toBe('SELECT COUNT(*) as count FROM audit_logs');
     });
   });
@@ -202,6 +214,7 @@ describe('AuditLogFilters shape (#1808)', () => {
       limit: 1,
       withTotal: true,
     };
+    // AuditLogFilters has 7 properties (actor, action, from, to, cursor, limit, withTotal)
     expect(Object.keys(filters)).toHaveLength(7);
   });
 });

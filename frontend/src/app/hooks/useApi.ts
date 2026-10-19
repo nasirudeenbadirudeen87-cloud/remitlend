@@ -272,6 +272,7 @@ export interface BorrowerLoan {
   id: number;
   principal: number;
   accruedInterest: number;
+  accruedLateFee: number;
   totalOwed: number;
   totalRepaid: number;
   nextPaymentDeadline: string;
@@ -300,6 +301,8 @@ export interface LoanDetails {
   approvedAt?: string;
   events: LoanEvent[];
   lateFees?: number;
+  extensionFee?: number;
+  extensionFee?: number;
   collateralLocked?: number;
   collateralRatio?: number;
   healthFactor?: number;
